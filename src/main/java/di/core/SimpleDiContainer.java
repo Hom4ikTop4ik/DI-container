@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.LongAdder;
 public final class SimpleDiContainer implements DiContainer {
 
     private final Map<String, BeanDefinition> defsByName;
+    private final Map<Class<?>, List<BeanDefinition>> defsByImplType;
     private final ConcurrentMap<String, Object> singletonCache = new ConcurrentHashMap<>();
     private final ThreadLocal<Map<String, Object>> threadCache =
             ThreadLocal.withInitial(HashMap::new);
@@ -22,6 +23,7 @@ public final class SimpleDiContainer implements DiContainer {
     public SimpleDiContainer(List<BeanDefinition> definitions) {
         Objects.requireNonNull(definitions, "definitions");
         this.defsByName = indexAndValidate(definitions);
+        this.defsByImplType = buildTypeIndex(defsByName.values());
     }
 
     private static Map<String, BeanDefinition> indexAndValidate(List<BeanDefinition> definitions) {
@@ -33,6 +35,15 @@ public final class SimpleDiContainer implements DiContainer {
             map.put(def.name(), def);
         }
         return Collections.unmodifiableMap(map);
+    }
+
+    private static Map<Class<?>, List<BeanDefinition>> buildTypeIndex(Collection<BeanDefinition> definitions) {
+        Map<Class<?>, List<BeanDefinition>> byType = new LinkedHashMap<>();
+        for (BeanDefinition def : definitions) {
+            byType.computeIfAbsent(def.implClass(), k -> new ArrayList<>()).add(def);
+        }
+        byType.replaceAll((k, v) -> Collections.unmodifiableList(v));
+        return Collections.unmodifiableMap(byType);
     }
 
     @Override
@@ -77,12 +88,19 @@ public final class SimpleDiContainer implements DiContainer {
     }
 
     private List<BeanDefinition> findCandidates(Class<?> type) {
-        ArrayList<BeanDefinition> result = new ArrayList<>();
+        List<BeanDefinition> result = new ArrayList<>();
+
+        List<BeanDefinition> exactMatches = defsByImplType.get(type);
+        if (exactMatches != null) {
+            result.addAll(exactMatches);
+        }
+
         for (BeanDefinition def : defsByName.values()) {
-            if (type.isAssignableFrom(def.implClass())) {
+            if (def.implClass() != type && type.isAssignableFrom(def.implClass())) {
                 result.add(def);
             }
         }
+
         return result;
     }
 
