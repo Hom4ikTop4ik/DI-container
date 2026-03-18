@@ -2,6 +2,9 @@ package demo;
 
 import di.core.SimpleDiContainer;
 import di.model.BeanDefinition;
+import di.model.LiteralValue;
+import di.model.MethodArg;
+import di.model.MethodInjection;
 import di.model.Scope;
 
 import java.util.List;
@@ -12,11 +15,41 @@ public class Main {
         public Foo() {}
     }
 
+    public static final class Person {
+        private final String name;
+        private int age;
+
+        public Person(String name) {
+            this.name = name;
+        }
+
+        public void setAge(int age) {
+            this.age = age;
+        }
+
+        @Override
+        public String toString() {
+            return "Person{name='%s', age=%d}".formatted(name, age);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         var container = new SimpleDiContainer(List.of(
                 new BeanDefinition("fooSingleton", Foo.class, Scope.SINGLETON),
                 new BeanDefinition("fooPrototype", Foo.class, Scope.PROTOTYPE),
-                new BeanDefinition("fooThread", Foo.class, Scope.THREAD)
+                new BeanDefinition("fooThread", Foo.class, Scope.THREAD),
+                new BeanDefinition(
+                        "person",
+                        Person.class,
+                        Scope.PROTOTYPE,
+                        List.of(
+                                new MethodArg(0, new LiteralValue("Alice"))
+                        ),
+                        List.of(
+                                new MethodInjection("setAge",
+                                        List.of(new MethodArg(0, new LiteralValue(30))))
+                        )
+                )
         ));
 
         Object s1 = container.getBean("fooSingleton");
@@ -36,5 +69,8 @@ public class Main {
 
         System.out.println("getBeanCount(\"fooSingleton\")=" + container.getGetBeanCount("fooSingleton"));
         System.out.println("isInstantiatedSingleton(\"fooSingleton\")=" + container.isInstantiatedSingleton("fooSingleton"));
+
+        Person p = container.getBean(Person.class);
+        System.out.println("person from container: " + p);
     }
 }
