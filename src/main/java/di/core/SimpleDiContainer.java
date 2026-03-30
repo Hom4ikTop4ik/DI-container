@@ -2,14 +2,13 @@ package di.core;
 
 import di.api.DiContainer;
 import di.model.*;
+import di.proxy.ScopedProxyFactory;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
-import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Proxy;
 import java.lang.reflect.Type;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,11 +28,17 @@ public final class SimpleDiContainer implements DiContainer {
 
     private final ConcurrentMap<String, LongAdder> getBeanCounters = new ConcurrentHashMap<>();
     private final ThreadLocal<Deque<String>> creationStack = ThreadLocal.withInitial(ArrayDeque::new);
+    private final di.proxy.ScopedProxyFactory scopedProxyFactory;
 
     public SimpleDiContainer(List<BeanDefinition> definitions) {
+        this(definitions, new di.proxy.ClojureJavaProxyFactory());
+    }
+
+    public SimpleDiContainer(List<BeanDefinition> definitions, ScopedProxyFactory scopedProxyFactory) {
         Objects.requireNonNull(definitions, "definitions");
         this.defsByName = indexAndValidate(definitions);
         this.defsByImplType = buildTypeIndex(defsByName.values());
+        this.scopedProxyFactory = Objects.requireNonNull(scopedProxyFactory, "scopedProxyFactory");
     }
 
     private static Map<String, BeanDefinition> indexAndValidate(List<BeanDefinition> definitions) {
@@ -398,17 +403,9 @@ public final class SimpleDiContainer implements DiContainer {
                         + "' requires proxy, but injection type is not an interface: " + injectionType.getName()
                         + resolutionPathSuffix());
             }
-            return createThreadScopedProxy(injectionType, dependency.name());
+            return this.scopedProxyFactory.createThreadScopedProxy(injectionType, dependency.name(), this);
         }
         return getBean(dependency.name());
-    }
-
-    private Object createThreadScopedProxy(Class<?> iface, String beanName) {
-        InvocationHandler handler = (proxy, method, args) -> {
-            Object target = getBean(beanName);
-            return method.invoke(target, args);
-        };
-        return Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface}, handler);
     }
 
     private static String formatCycle(Deque<String> stack, String repeatedName) {
