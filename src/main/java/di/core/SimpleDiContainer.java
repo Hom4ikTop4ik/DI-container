@@ -1,15 +1,23 @@
 package di.core;
 
 import di.api.DiContainer;
-import di.model.BeanDefinition;
 import di.model.*;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Proxy;
+import java.lang.reflect.Type;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.LongAdder;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Provider;
 
 public final class SimpleDiContainer implements DiContainer {
 
@@ -20,6 +28,7 @@ public final class SimpleDiContainer implements DiContainer {
             ThreadLocal.withInitial(HashMap::new);
 
     private final ConcurrentMap<String, LongAdder> getBeanCounters = new ConcurrentHashMap<>();
+    private final ThreadLocal<Deque<String>> creationStack = ThreadLocal.withInitial(ArrayDeque::new);
 
     public SimpleDiContainer(List<BeanDefinition> definitions) {
         Objects.requireNonNull(definitions, "definitions");
@@ -107,31 +116,37 @@ public final class SimpleDiContainer implements DiContainer {
 
     private Object createNew(BeanDefinition def) {
         try {
-            Object instance = instantiateWithConstructor(def);
-            performMethodInjections(def, instance);
+            Deque<String> stack = creationStack.get();
+            if (stack.contains(def.name())) {
+                throw new IllegalStateException("Cyclic dependency detected: " + formatCycle(stack, def.name()));
+            }
+            stack.addLast(def.name());
+
+            Object instance = instantiate(def);
+            performConfigMethodInjections(def, instance);
+            performInjectFieldInjections(def, instance);
+            performInjectMethodInjections(def, instance);
             return instance;
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Failed to instantiate bean: " + def, e);
+        } finally {
+            Deque<String> stack = creationStack.get();
+            if (!stack.isEmpty() && Objects.equals(stack.peekLast(), def.name())) {
+                stack.removeLast();
+            }
         }
     }
 
-    private Object instantiateWithConstructor(BeanDefinition def) throws ReflectiveOperationException {
+    private Object instantiate(BeanDefinition def) throws ReflectiveOperationException {
+        if (!def.constructorArgs().isEmpty()) {
+            return instantiateFromConfig(def);
+        }
+        return instantiateFromInject(def);
+    }
+
+    private Object instantiateFromConfig(BeanDefinition def) throws ReflectiveOperationException {
         Constructor<?>[] ctors = def.implClass().getDeclaredConstructors();
         List<MethodArg> ctorArgs = def.constructorArgs();
-
-        if (ctorArgs.isEmpty()) {
-            if (ctors.length != 1) {
-                throw new IllegalStateException("Class " + def.implClass().getName()
-                        + " must have exactly 1 constructor for zero-arg injection (currently: " + ctors.length + ")");
-            }
-            Constructor<?> ctor = ctors[0];
-            if (ctor.getParameterCount() != 0) {
-                throw new IllegalStateException("Constructor for " + def.implClass().getName()
-                        + " expected to have no parameters");
-            }
-            ctor.setAccessible(true);
-            return ctor.newInstance();
-        }
 
         int maxIndex = ctorArgs.stream().mapToInt(MethodArg::index).max().orElse(-1);
         int paramCount = maxIndex + 1;
@@ -162,13 +177,49 @@ public final class SimpleDiContainer implements DiContainer {
                 throw new IllegalStateException("Constructor arg index " + idx
                         + " is out of bounds for " + def.implClass().getName());
             }
-            args[idx] = resolveValue(arg.value(), paramTypes[idx]);
+            args[idx] = resolveConfigValue(def, arg.value(), paramTypes[idx]);
         }
 
         return ctor.newInstance(args);
     }
 
-    private void performMethodInjections(BeanDefinition def, Object instance) throws ReflectiveOperationException {
+    private Object instantiateFromInject(BeanDefinition def) throws ReflectiveOperationException {
+        Constructor<?> ctor = selectInjectConstructor(def.implClass());
+        ctor.setAccessible(true);
+
+        Parameter[] params = ctor.getParameters();
+        Type[] genericTypes = ctor.getGenericParameterTypes();
+        Object[] args = new Object[params.length];
+        for (int i = 0; i < params.length; i++) {
+            args[i] = resolveInjectionPoint(def, params[i].getType(), genericTypes[i], params[i].getAnnotation(Named.class));
+        }
+
+        return ctor.newInstance(args);
+    }
+
+    private Constructor<?> selectInjectConstructor(Class<?> implClass) {
+        Constructor<?>[] ctors = implClass.getDeclaredConstructors();
+        List<Constructor<?>> injectCtors = new ArrayList<>();
+        for (Constructor<?> c : ctors) {
+            if (c.isAnnotationPresent(Inject.class)) {
+                injectCtors.add(c);
+            }
+        }
+
+        if (injectCtors.size() == 1) {
+            return injectCtors.getFirst();
+        }
+        if (injectCtors.size() > 1) {
+            throw new IllegalStateException("Multiple @Inject constructors found in " + implClass.getName());
+        }
+
+        if (ctors.length == 1) {
+            return ctors[0];
+        }
+        throw new IllegalStateException("No @Inject constructor and multiple constructors found in " + implClass.getName());
+    }
+
+    private void performConfigMethodInjections(BeanDefinition def, Object instance) throws ReflectiveOperationException {
         Class<?> clazz = def.implClass();
         for (MethodInjection injection : def.methodInjections()) {
             String methodName = injection.methodName();
@@ -201,35 +252,176 @@ public final class SimpleDiContainer implements DiContainer {
                     throw new IllegalStateException("Method arg index " + idx
                             + " is out of bounds for method '" + methodName + "' on " + clazz.getName());
                 }
-                argValues[idx] = resolveValue(arg.value(), paramTypes[idx]);
+                argValues[idx] = resolveConfigValue(def, arg.value(), paramTypes[idx]);
             }
 
             method.invoke(instance, argValues);
         }
     }
 
-    private Object resolveValue(BeanValue value, Class<?> expectedType) {
+    private void performInjectFieldInjections(BeanDefinition current, Object instance) throws ReflectiveOperationException {
+        for (Class<?> c = current.implClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Field f : c.getDeclaredFields()) {
+                if (!f.isAnnotationPresent(Inject.class)) {
+                    continue;
+                }
+                f.setAccessible(true);
+                Object dep = resolveInjectionPoint(current, f.getType(), f.getGenericType(), f.getAnnotation(Named.class));
+                f.set(instance, dep);
+            }
+        }
+    }
+
+    private void performInjectMethodInjections(BeanDefinition current, Object instance) throws ReflectiveOperationException {
+        Class<?> clazz = current.implClass();
+
+        Set<String> configInjectedMethods = new HashSet<>();
+        for (MethodInjection mi : current.methodInjections()) {
+            configInjectedMethods.add(mi.methodName());
+        }
+
+        for (Method m : clazz.getMethods()) {
+            if (!m.isAnnotationPresent(Inject.class)) {
+                continue;
+            }
+            if (configInjectedMethods.contains(m.getName())) {
+                throw new IllegalStateException("Double injection source for method '" + m.getName()
+                        + "' on " + clazz.getName() + ": both config and @Inject");
+            }
+
+            m.setAccessible(true);
+            Parameter[] params = m.getParameters();
+            Type[] genericTypes = m.getGenericParameterTypes();
+            Object[] args = new Object[params.length];
+            for (int i = 0; i < params.length; i++) {
+                args[i] = resolveInjectionPoint(current, params[i].getType(), genericTypes[i], params[i].getAnnotation(Named.class));
+            }
+            m.invoke(instance, args);
+        }
+    }
+
+    private Object resolveConfigValue(BeanDefinition current, BeanValue value, Class<?> expectedType) {
         if (value instanceof LiteralValue literal) {
-            return literal.value();
+            Object v = literal.value();
+            if (v == null) {
+                return null;
+            }
+            if (expectedType.isInstance(v) || expectedType.isPrimitive()) {
+                return v;
+            }
+            return v;
         }
         if (value instanceof RefValue ref) {
-            return getBean(ref.beanName());
+            BeanDefinition dep = resolveBeanDefinition(Object.class, ref.beanName());
+            return resolveScopedDependency(current, dep, Object.class, null);
         }
         if (value instanceof ListValue list) {
             List<Object> result = new ArrayList<>();
             for (BeanValue v : list.elements()) {
-                result.add(resolveValue(v, Object.class));
+                result.add(resolveConfigValue(current, v, Object.class));
             }
             return result;
         }
         if (value instanceof MapValue map) {
             Map<String, Object> result = new LinkedHashMap<>();
             for (Map.Entry<String, BeanValue> e : map.entries().entrySet()) {
-                result.put(e.getKey(), resolveValue(e.getValue(), Object.class));
+                result.put(e.getKey(), resolveConfigValue(current, e.getValue(), Object.class));
             }
             return result;
         }
         throw new IllegalArgumentException("Unsupported BeanValue: " + value);
+    }
+
+    private Object resolveInjectionPoint(BeanDefinition current,
+                                        Class<?> rawType,
+                                        Type genericType,
+                                        Named named) {
+        String name = named == null ? null : named.value();
+
+        if (Provider.class.equals(rawType)) {
+            Class<?> providedRaw = extractProviderType(genericType);
+            return (Provider<?>) () -> {
+                if (name != null) {
+                    return getBean(providedRaw, name);
+                }
+                return getBean(providedRaw);
+            };
+        }
+
+        BeanDefinition dep = resolveBeanDefinition(rawType, name);
+        return resolveScopedDependency(current, dep, rawType, name);
+    }
+
+    private Class<?> extractProviderType(Type genericType) {
+        if (genericType instanceof ParameterizedType pt) {
+            Type[] args = pt.getActualTypeArguments();
+            if (args.length == 1) {
+                Type t = args[0];
+                if (t instanceof Class<?> c) {
+                    return c;
+                }
+            }
+        }
+        throw new IllegalStateException("Provider<T> must have concrete generic type parameter");
+    }
+
+    private BeanDefinition resolveBeanDefinition(Class<?> type, String name) {
+        if (name != null) {
+            BeanDefinition def = defsByName.get(name);
+            if (def == null) {
+                throw new NoSuchElementException("Bean not found by name: " + name);
+            }
+            if (!type.isAssignableFrom(def.implClass()) && type != Object.class) {
+                throw new IllegalStateException("Bean '" + name + "' is " + def.implClass().getName()
+                        + ", not assignable to " + type.getName());
+            }
+            return def;
+        }
+
+        List<BeanDefinition> candidates = findCandidates(type);
+        if (candidates.isEmpty()) {
+            throw new NoSuchElementException("No beans found for type: " + type.getName());
+        }
+        if (candidates.size() > 1) {
+            throw new IllegalStateException("Ambiguous beans for type %s: %s"
+                    .formatted(type.getName(), candidates.stream().map(BeanDefinition::name).toList()));
+        }
+        return candidates.getFirst();
+    }
+
+    private Object resolveScopedDependency(BeanDefinition current,
+                                          BeanDefinition dependency,
+                                          Class<?> injectionType,
+                                          String explicitName) {
+        if (current.scope() == Scope.SINGLETON && dependency.scope() == Scope.THREAD) {
+            if (!injectionType.isInterface()) {
+                throw new IllegalStateException("thread-scoped dependency '" + dependency.name()
+                        + "' injected into singleton '" + current.name()
+                        + "' requires proxy, but injection type is not an interface: " + injectionType.getName());
+            }
+            return createThreadScopedProxy(injectionType, dependency.name());
+        }
+        return getBean(dependency.name());
+    }
+
+    private Object createThreadScopedProxy(Class<?> iface, String beanName) {
+        InvocationHandler handler = (proxy, method, args) -> {
+            Object target = getBean(beanName);
+            return method.invoke(target, args);
+        };
+        return Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface}, handler);
+    }
+
+    private static String formatCycle(Deque<String> stack, String repeatedName) {
+        List<String> list = new ArrayList<>(stack);
+        int idx = list.indexOf(repeatedName);
+        if (idx < 0) {
+            list.add(repeatedName);
+            return String.join(" -> ", list);
+        }
+        List<String> cycle = new ArrayList<>(list.subList(idx, list.size()));
+        cycle.add(repeatedName);
+        return String.join(" -> ", cycle);
     }
 
     private void countGetBean(String name) {
