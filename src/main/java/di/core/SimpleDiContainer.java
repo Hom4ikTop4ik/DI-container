@@ -61,7 +61,7 @@ public final class SimpleDiContainer implements DiContainer {
         countGetBean(name);
         BeanDefinition def = defsByName.get(name);
         if (def == null) {
-            throw new NoSuchElementException("Bean not found by name: " + name);
+            throw new NoSuchElementException("Bean not found by name: " + name + resolutionPathSuffix());
         }
         return switch (def.scope()) {
             case SINGLETON -> singletonCache.computeIfAbsent(def.name(), n -> createNew(def));
@@ -76,11 +76,12 @@ public final class SimpleDiContainer implements DiContainer {
         List<BeanDefinition> candidates = findCandidates(type);
 
         if (candidates.isEmpty()) {
-            throw new NoSuchElementException("No beans found for type: " + type.getName());
+            throw new NoSuchElementException("No beans found for type: " + type.getName() + resolutionPathSuffix());
         }
         if (candidates.size() > 1) {
             throw new IllegalStateException("Ambiguous beans for type %s: %s"
-                    .formatted(type.getName(), candidates.stream().map(BeanDefinition::name).toList()));
+                    .formatted(type.getName(), candidates.stream().map(BeanDefinition::name).toList())
+                    + resolutionPathSuffix());
         }
         return type.cast(getBean(candidates.getFirst().name()));
     }
@@ -119,6 +120,7 @@ public final class SimpleDiContainer implements DiContainer {
             Deque<String> stack = creationStack.get();
             if (stack.contains(def.name())) {
                 throw new IllegalStateException("Cyclic dependency detected: " + formatCycle(stack, def.name()));
+            // Note: resolution path is already encoded into the cycle string above.
             }
             stack.addLast(def.name());
 
@@ -128,7 +130,7 @@ public final class SimpleDiContainer implements DiContainer {
             performInjectMethodInjections(def, instance);
             return instance;
         } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException("Failed to instantiate bean: " + def, e);
+            throw new IllegalStateException("Failed to instantiate bean: " + def + resolutionPathSuffix(), e);
         } finally {
             Deque<String> stack = creationStack.get();
             if (!stack.isEmpty() && Objects.equals(stack.peekLast(), def.name())) {
@@ -159,11 +161,11 @@ public final class SimpleDiContainer implements DiContainer {
         }
         if (matches.isEmpty()) {
             throw new IllegalStateException("No constructor with " + paramCount + " parameter(s) for "
-                    + def.implClass().getName());
+                    + def.implClass().getName() + resolutionPathSuffix());
         }
         if (matches.size() > 1) {
             throw new IllegalStateException("Ambiguous constructor overload for "
-                    + def.implClass().getName() + " with " + paramCount + " parameter(s)");
+                    + def.implClass().getName() + " with " + paramCount + " parameter(s)" + resolutionPathSuffix());
         }
 
         Constructor<?> ctor = matches.getFirst();
@@ -175,7 +177,7 @@ public final class SimpleDiContainer implements DiContainer {
             int idx = arg.index();
             if (idx >= paramCount) {
                 throw new IllegalStateException("Constructor arg index " + idx
-                        + " is out of bounds for " + def.implClass().getName());
+                        + " is out of bounds for " + def.implClass().getName() + resolutionPathSuffix());
             }
             args[idx] = resolveConfigValue(def, arg.value(), paramTypes[idx]);
         }
@@ -210,13 +212,14 @@ public final class SimpleDiContainer implements DiContainer {
             return injectCtors.getFirst();
         }
         if (injectCtors.size() > 1) {
-            throw new IllegalStateException("Multiple @Inject constructors found in " + implClass.getName());
+            throw new IllegalStateException("Multiple @Inject constructors found in " + implClass.getName() + resolutionPathSuffix());
         }
 
         if (ctors.length == 1) {
             return ctors[0];
         }
-        throw new IllegalStateException("No @Inject constructor and multiple constructors found in " + implClass.getName());
+        throw new IllegalStateException("No @Inject constructor and multiple constructors found in "
+                + implClass.getName() + resolutionPathSuffix());
     }
 
     private void performConfigMethodInjections(BeanDefinition def, Object instance) throws ReflectiveOperationException {
@@ -234,11 +237,11 @@ public final class SimpleDiContainer implements DiContainer {
 
             if (candidates.isEmpty()) {
                 throw new IllegalStateException("No suitable method '" + methodName + "' found on "
-                        + clazz.getName());
+                        + clazz.getName() + resolutionPathSuffix());
             }
             if (candidates.size() > 1) {
                 throw new IllegalStateException("Ambiguous setter overload for method '" + methodName
-                        + "' on " + clazz.getName());
+                        + "' on " + clazz.getName() + resolutionPathSuffix());
             }
 
             Method method = candidates.getFirst();
@@ -250,7 +253,8 @@ public final class SimpleDiContainer implements DiContainer {
                 int idx = arg.index();
                 if (idx < 0 || idx >= argValues.length) {
                     throw new IllegalStateException("Method arg index " + idx
-                            + " is out of bounds for method '" + methodName + "' on " + clazz.getName());
+                            + " is out of bounds for method '" + methodName + "' on " + clazz.getName()
+                            + resolutionPathSuffix());
                 }
                 argValues[idx] = resolveConfigValue(def, arg.value(), paramTypes[idx]);
             }
@@ -286,7 +290,7 @@ public final class SimpleDiContainer implements DiContainer {
             }
             if (configInjectedMethods.contains(m.getName())) {
                 throw new IllegalStateException("Double injection source for method '" + m.getName()
-                        + "' on " + clazz.getName() + ": both config and @Inject");
+                        + "' on " + clazz.getName() + ": both config and @Inject" + resolutionPathSuffix());
             }
 
             m.setAccessible(true);
@@ -302,14 +306,7 @@ public final class SimpleDiContainer implements DiContainer {
 
     private Object resolveConfigValue(BeanDefinition current, BeanValue value, Class<?> expectedType) {
         if (value instanceof LiteralValue literal) {
-            Object v = literal.value();
-            if (v == null) {
-                return null;
-            }
-            if (expectedType.isInstance(v) || expectedType.isPrimitive()) {
-                return v;
-            }
-            return v;
+            return ValueConverter.convert(literal.value(), expectedType);
         }
         if (value instanceof RefValue ref) {
             BeanDefinition dep = resolveBeanDefinition(Object.class, ref.beanName());
@@ -362,29 +359,30 @@ public final class SimpleDiContainer implements DiContainer {
                 }
             }
         }
-        throw new IllegalStateException("Provider<T> must have concrete generic type parameter");
+        throw new IllegalStateException("Provider<T> must have concrete generic type parameter" + resolutionPathSuffix());
     }
 
     private BeanDefinition resolveBeanDefinition(Class<?> type, String name) {
         if (name != null) {
             BeanDefinition def = defsByName.get(name);
             if (def == null) {
-                throw new NoSuchElementException("Bean not found by name: " + name);
+                throw new NoSuchElementException("Bean not found by name: " + name + resolutionPathSuffix());
             }
             if (!type.isAssignableFrom(def.implClass()) && type != Object.class) {
                 throw new IllegalStateException("Bean '" + name + "' is " + def.implClass().getName()
-                        + ", not assignable to " + type.getName());
+                        + ", not assignable to " + type.getName() + resolutionPathSuffix());
             }
             return def;
         }
 
         List<BeanDefinition> candidates = findCandidates(type);
         if (candidates.isEmpty()) {
-            throw new NoSuchElementException("No beans found for type: " + type.getName());
+            throw new NoSuchElementException("No beans found for type: " + type.getName() + resolutionPathSuffix());
         }
         if (candidates.size() > 1) {
             throw new IllegalStateException("Ambiguous beans for type %s: %s"
-                    .formatted(type.getName(), candidates.stream().map(BeanDefinition::name).toList()));
+                    .formatted(type.getName(), candidates.stream().map(BeanDefinition::name).toList())
+                    + resolutionPathSuffix());
         }
         return candidates.getFirst();
     }
@@ -397,7 +395,8 @@ public final class SimpleDiContainer implements DiContainer {
             if (!injectionType.isInterface()) {
                 throw new IllegalStateException("thread-scoped dependency '" + dependency.name()
                         + "' injected into singleton '" + current.name()
-                        + "' requires proxy, but injection type is not an interface: " + injectionType.getName());
+                        + "' requires proxy, but injection type is not an interface: " + injectionType.getName()
+                        + resolutionPathSuffix());
             }
             return createThreadScopedProxy(injectionType, dependency.name());
         }
@@ -442,5 +441,139 @@ public final class SimpleDiContainer implements DiContainer {
     public long getGetBeanCount(String name) {
         LongAdder adder = getBeanCounters.get(name);
         return adder == null ? 0L : adder.sum();
+    }
+
+    @Override
+    public Map<String, List<String>> getDependencyGraph() {
+        Map<String, Set<String>> edges = new LinkedHashMap<>();
+        for (BeanDefinition def : defsByName.values()) {
+            edges.put(def.name(), new LinkedHashSet<>());
+        }
+
+        // 1) Конфиг-ссылки (RefValue) из constructorArgs и methodInjections
+        for (BeanDefinition def : defsByName.values()) {
+            Set<String> deps = edges.get(def.name());
+            for (MethodArg arg : def.constructorArgs()) {
+                collectRefs(arg.value(), deps);
+            }
+            for (MethodInjection mi : def.methodInjections()) {
+                for (MethodArg arg : mi.arguments()) {
+                    collectRefs(arg.value(), deps);
+                }
+            }
+        }
+
+        // 2) Зависимости из точек @Inject/@Named (best-effort, без создания объектов)
+        for (BeanDefinition def : defsByName.values()) {
+            Set<String> deps = edges.get(def.name());
+            addInjectDependenciesFromConstructors(def, deps);
+            addInjectDependenciesFromFields(def, deps);
+            addInjectDependenciesFromMethods(def, deps);
+        }
+
+        Map<String, List<String>> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> e : edges.entrySet()) {
+            result.put(e.getKey(), List.copyOf(e.getValue()));
+        }
+        return result;
+    }
+
+    private void addInjectDependenciesFromConstructors(BeanDefinition def, Set<String> deps) {
+        for (Constructor<?> ctor : def.implClass().getDeclaredConstructors()) {
+            if (!ctor.isAnnotationPresent(Inject.class)) {
+                continue;
+            }
+            Parameter[] params = ctor.getParameters();
+            Type[] genericTypes = ctor.getGenericParameterTypes();
+            for (int i = 0; i < params.length; i++) {
+                Named named = params[i].getAnnotation(Named.class);
+                addInjectDependencyForType(genericTypes[i], params[i].getType(), named, deps);
+            }
+        }
+    }
+
+    private void addInjectDependenciesFromFields(BeanDefinition def, Set<String> deps) {
+        for (Class<?> c = def.implClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (!f.isAnnotationPresent(Inject.class)) {
+                    continue;
+                }
+                Named named = f.getAnnotation(Named.class);
+                addInjectDependencyForType(f.getGenericType(), f.getType(), named, deps);
+            }
+        }
+    }
+
+    private void addInjectDependenciesFromMethods(BeanDefinition def, Set<String> deps) {
+        for (Method m : def.implClass().getMethods()) {
+            if (!m.isAnnotationPresent(Inject.class)) {
+                continue;
+            }
+            Parameter[] params = m.getParameters();
+            Type[] genericTypes = m.getGenericParameterTypes();
+            for (int i = 0; i < params.length; i++) {
+                Named named = params[i].getAnnotation(Named.class);
+                addInjectDependencyForType(genericTypes[i], params[i].getType(), named, deps);
+            }
+        }
+    }
+
+    private void addInjectDependencyForType(Type genericType,
+                                              Class<?> rawType,
+                                              Named named,
+                                              Set<String> deps) {
+        if (Provider.class.equals(rawType)) {
+            Class<?> provided;
+            try {
+                provided = extractProviderType(genericType);
+            } catch (RuntimeException e) {
+                // getDependencyGraph — best-effort мониторинг, не должен падать из-за некорректных сигнатур.
+                return;
+            }
+            if (named != null) {
+                deps.add(named.value());
+                return;
+            }
+            for (BeanDefinition cand : findCandidates(provided)) {
+                deps.add(cand.name());
+            }
+            return;
+        }
+
+        if (named != null) {
+            deps.add(named.value());
+            return;
+        }
+
+        for (BeanDefinition cand : findCandidates(rawType)) {
+            deps.add(cand.name());
+        }
+    }
+
+    private void collectRefs(BeanValue value, Set<String> out) {
+        if (value instanceof RefValue ref) {
+            out.add(ref.beanName());
+            return;
+        }
+        if (value instanceof ListValue list) {
+            for (BeanValue v : list.elements()) {
+                collectRefs(v, out);
+            }
+            return;
+        }
+        if (value instanceof MapValue map) {
+            for (BeanValue v : map.entries().values()) {
+                collectRefs(v, out);
+            }
+            return;
+        }
+    }
+
+    private String resolutionPathSuffix() {
+        Deque<String> stack = creationStack.get();
+        if (stack == null || stack.isEmpty()) {
+            return "";
+        }
+        return " Resolution path: " + String.join(" -> ", stack);
     }
 }
