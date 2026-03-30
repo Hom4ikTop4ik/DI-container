@@ -3,6 +3,7 @@ package di.api;
 import di.model.BeanDefinition;
 
 import java.util.List;
+import java.util.Map;
 
 public interface DiContainer {
     Object getBean(String name);
@@ -16,4 +17,11 @@ public interface DiContainer {
     boolean isInstantiatedSingleton(String name);
 
     long getGetBeanCount(String name);
+
+    /**
+     * Граф зависимостей: "имя бина" -> список "имён бинов, от которых он зависит".
+     * Реализация не обязана строить граф с полной достоверностью в случаях неоднозначности,
+     * но должна быть полезной для диагностики.
+     */
+    Map<String, List<String>> getDependencyGraph();
 }
