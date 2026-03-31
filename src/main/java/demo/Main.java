@@ -1,13 +1,8 @@
     package demo;
 
+    import di.config.EdnConfigLoader;
     import di.core.SimpleDiContainer;
-    import di.model.BeanDefinition;
-    import di.model.LiteralValue;
-    import di.model.MethodArg;
-    import di.model.MethodInjection;
-    import di.model.Scope;
 
-    import java.util.List;
     import java.util.UUID;
     import javax.inject.Inject;
     import javax.inject.Named;
@@ -105,30 +100,8 @@
         }
 
         public static void main(String[] args) throws Exception {
-            var container = new SimpleDiContainer(List.of(
-                    new BeanDefinition("fooSingleton", Foo.class, Scope.SINGLETON),
-                    new BeanDefinition("fooPrototype", Foo.class, Scope.PROTOTYPE),
-                    new BeanDefinition("fooThread", Foo.class, Scope.THREAD),
-                    new BeanDefinition(
-                            "person",
-                            Person.class,
-                            Scope.PROTOTYPE,
-                            List.of(
-                                    new MethodArg(0, new LiteralValue("Alice"))
-                            ),
-                            List.of(
-                                    new MethodInjection("setAge",
-                                            List.of(new MethodArg(0, new LiteralValue(30))))
-                            )
-                    )
-                    ,
-                    new BeanDefinition("enGreeter", EnglishGreeter.class, Scope.SINGLETON),
-                    new BeanDefinition("ruGreeter", RussianGreeter.class, Scope.SINGLETON),
-                    new BeanDefinition("threadRequestId", ThreadRequestIdProvider.class, Scope.THREAD),
-                    new BeanDefinition("welcomeService", WelcomeService.class, Scope.SINGLETON),
-                    new BeanDefinition("prototypeMessage", PrototypeMessage.class, Scope.PROTOTYPE),
-                    new BeanDefinition("messagePrinter", MessagePrinter.class, Scope.SINGLETON)
-            ));
+            var defs = new EdnConfigLoader().loadFromResource("di.edn");
+            var container = new SimpleDiContainer(defs);
 
             Object s1 = container.getBean("fooSingleton");
             Object s2 = container.getBean("fooSingleton");
