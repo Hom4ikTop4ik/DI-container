@@ -1,0 +1,45 @@
+{:beans
+ [{:name "fooSingleton"
+   :class "demo.Main$Foo"
+   :scope :singleton}
+
+  {:name "fooPrototype"
+   :class "demo.Main$Foo"
+   :scope :prototype}
+
+  {:name "fooThread"
+   :class "demo.Main$Foo"
+   :scope :thread}
+
+  {:name "person"
+   :class "demo.Main$Person"
+   :scope :prototype
+   :constructor-args
+   [{:index 0 :arg (value "Alice")}]
+   :methods
+   [{:name "setAge"
+     :args [{:index 0 :arg (value 30)}]}]}
+
+  {:name "enGreeter"
+   :class "demo.Main$EnglishGreeter"
+   :scope :singleton}
+
+  {:name "ruGreeter"
+   :class "demo.Main$RussianGreeter"
+   :scope :singleton}
+
+  {:name "threadRequestId"
+   :class "demo.Main$ThreadRequestIdProvider"
+   :scope :thread}
+
+  {:name "welcomeService"
+   :class "demo.Main$WelcomeService"
+   :scope :singleton}
+
+  {:name "prototypeMessage"
+   :class "demo.Main$PrototypeMessage"
+   :scope :prototype}
+
+  {:name "messagePrinter"
+   :class "demo.Main$MessagePrinter"
+   :scope :singleton}]}
