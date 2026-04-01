@@ -44,13 +44,27 @@ public final class EdnConfigLoader {
 
     private static final IFn EDN_READ = Clojure.var("clojure.edn", "read");
 
+    private static final Keyword KW_BEANS = kw("beans");
+
+    private static final Keyword KW_NAME = kw("name");
+    private static final Keyword KW_CLASS = kw("class");
+    private static final Keyword KW_SCOPE = kw("scope");
+    private static final Keyword KW_CONSTRUCTOR_ARGS = kw("constructor-args");
+    private static final Keyword KW_METHODS = kw("methods");
+
+    private static final Keyword KW_INDEX = kw("index");
+    private static final Keyword KW_ARG = kw("arg");
+
+    private static final Keyword KW_METHOD_NAME = kw("name");
+    private static final Keyword KW_METHOD_ARGS = kw("args");
+
     // допустимые ключи в bean-map
     private static final Set<Keyword> ALLOWED_BEAN_KEYS = Set.of(
-            kw("name"),
-            kw("class"),
-            kw("scope"),
-            kw("constructor-args"),
-            kw("methods")
+            KW_NAME,
+            KW_CLASS,
+            KW_SCOPE,
+            KW_CONSTRUCTOR_ARGS,
+            KW_METHODS
     );
 
     public List<BeanDefinition> loadFromResource(String resourceName) {
@@ -84,7 +98,7 @@ public final class EdnConfigLoader {
         }
 
         IPersistentMap rootMap = requireMap(root, "root");
-        Object beansObj = rootMap.valAt(kw("beans"));
+        Object beansObj = rootMap.valAt(KW_BEANS);
         if (beansObj == null) {
             throw new EdnValidationException("Missing required key :beans at root");
         }
@@ -95,15 +109,22 @@ public final class EdnConfigLoader {
         Set<String> names = new HashSet<>();
 
         for (int i = 0; i < beansVec.count(); i++) {
-            IPersistentMap bean = requireMap(beansVec.nth(i), "root.:beans[" + i + "]");
-            validateNoUnknownBeanKeys(bean, "root.:beans[" + i + "]");
+            String beanCtx = "root.:beans[" + i + "]";
+            IPersistentMap bean = requireMap(beansVec.nth(i), beanCtx);
 
-            String name = requireString(bean.valAt(kw("name")), ctx(i, ":name"));
+            validateNoUnknownBeanKeys(bean, beanCtx);
+
+            // Fail-fast: required keys
+            requirePresent(bean, KW_NAME, beanCtx);
+            requirePresent(bean, KW_CLASS, beanCtx);
+            requirePresent(bean, KW_SCOPE, beanCtx);
+
+            String name = requireString(bean.valAt(KW_NAME), ctx(i, ":name"));
             if (!names.add(name)) {
                 throw new EdnValidationException("Duplicate bean name: " + name);
             }
 
-            String className = requireString(bean.valAt(kw("class")), ctx(i, ":class"));
+            String className = requireString(bean.valAt(KW_CLASS), ctx(i, ":class"));
             Class<?> implClass;
             try {
                 implClass = Class.forName(className);
@@ -111,10 +132,10 @@ public final class EdnConfigLoader {
                 throw new EdnValidationException("Class not found for bean '" + name + "': " + className, e);
             }
 
-            Scope scope = parseScope(bean.valAt(kw("scope")), ctx(i, ":scope"));
+            Scope scope = parseScope(bean.valAt(KW_SCOPE), ctx(i, ":scope"));
 
-            List<MethodArg> ctorArgs = parseConstructorArgs(bean.valAt(kw("constructor-args")), i);
-            List<MethodInjection> methodInjections = parseMethods(bean.valAt(kw("methods")), i);
+            List<MethodArg> ctorArgs = parseConstructorArgs(bean.valAt(KW_CONSTRUCTOR_ARGS), i);
+            List<MethodInjection> methodInjections = parseMethods(bean.valAt(KW_METHODS), i);
 
             defs.add(new BeanDefinition(name, implClass, scope, ctorArgs, methodInjections));
         }
@@ -128,29 +149,31 @@ public final class EdnConfigLoader {
 
     private List<MethodArg> parseConstructorArgs(Object obj, int beanIndex) {
         if (obj == null) return List.of();
-        IPersistentVector vec = requireVector(obj, ctx(beanIndex, ":constructor-args"));
+
+        String baseCtx = ctx(beanIndex, ":constructor-args");
+        IPersistentVector vec = requireVector(obj, baseCtx);
 
         Set<Integer> usedIndexes = new HashSet<>();
         List<MethodArg> out = new ArrayList<>(vec.count());
 
         for (int i = 0; i < vec.count(); i++) {
-            IPersistentMap argMap = requireMap(vec.nth(i), ctx(beanIndex, ":constructor-args[" + i + "]"));
+            String argCtx = baseCtx + "[" + i + "]";
+            IPersistentMap argMap = requireMap(vec.nth(i), argCtx);
 
-            int index = requireInt(argMap.valAt(kw("index")), ctx(beanIndex, "ctor-arg.:index"));
+            requirePresent(argMap, KW_INDEX, argCtx);
+            requirePresent(argMap, KW_ARG, argCtx);
 
+            int index = requireInt(argMap.valAt(KW_INDEX), ctx(beanIndex, "ctor-arg[" + i + "].:index"));
             if (index < 0) {
-                throw new EdnValidationException(ctx(beanIndex, "ctor-arg.:index") + ": index must be >= 0, got: " + index);
+                throw new EdnValidationException(ctx(beanIndex, "ctor-arg[" + i + "].:index")
+                        + ": index must be >= 0, got: " + index);
             }
             if (!usedIndexes.add(index)) {
-                throw new EdnValidationException(ctx(beanIndex, ":constructor-args") + ": duplicate :index " + index);
+                throw new EdnValidationException(baseCtx + ": duplicate :index " + index);
             }
 
-            Object form = argMap.valAt(kw("arg"));
-            if (form == null) {
-                throw new EdnValidationException(ctx(beanIndex, "ctor-arg.:arg") + ": missing :arg");
-            }
-
-            BeanValue value = parseArgForm(form, ctx(beanIndex, "ctor-arg.:arg"));
+            Object form = argMap.valAt(KW_ARG);
+            BeanValue value = parseArgForm(form, ctx(beanIndex, "ctor-arg[" + i + "].:arg"));
             out.add(new MethodArg(index, value));
         }
 
@@ -163,36 +186,44 @@ public final class EdnConfigLoader {
 
     private List<MethodInjection> parseMethods(Object obj, int beanIndex) {
         if (obj == null) return List.of();
-        IPersistentVector vec = requireVector(obj, ctx(beanIndex, ":methods"));
+
+        String baseCtx = ctx(beanIndex, ":methods");
+        IPersistentVector vec = requireVector(obj, baseCtx);
 
         List<MethodInjection> out = new ArrayList<>(vec.count());
         for (int i = 0; i < vec.count(); i++) {
-            IPersistentMap m = requireMap(vec.nth(i), ctx(beanIndex, ":methods[" + i + "]"));
+            String mCtx = baseCtx + "[" + i + "]";
+            IPersistentMap m = requireMap(vec.nth(i), mCtx);
 
-            String methodName = requireString(m.valAt(kw("name")), ctx(beanIndex, "method.:name"));
+            requirePresent(m, KW_METHOD_NAME, mCtx);
 
-            Object argsObj = m.valAt(kw("args"));
-            IPersistentVector argsVec = argsObj == null ? emptyVector() : requireVector(argsObj, ctx(beanIndex, "method.:args"));
+            String methodName = requireString(m.valAt(KW_METHOD_NAME), ctx(beanIndex, "method[" + i + "].:name"));
+
+            Object argsObj = m.valAt(KW_METHOD_ARGS);
+            IPersistentVector argsVec = argsObj == null ? emptyVector() : requireVector(argsObj, ctx(beanIndex, "method[" + i + "].:args"));
 
             List<MethodArg> args = new ArrayList<>(argsVec.count());
             Set<Integer> usedIndexes = new HashSet<>();
-            for (int j = 0; j < argsVec.count(); j++) {
-                IPersistentMap argMap = requireMap(argsVec.nth(j), ctx(beanIndex, "method.:args[" + j + "]"));
 
-                int index = requireInt(argMap.valAt(kw("index")), ctx(beanIndex, "method-arg.:index"));
+            for (int j = 0; j < argsVec.count(); j++) {
+                String aCtx = ctx(beanIndex, "method[" + i + "].:args[" + j + "]");
+                IPersistentMap argMap = requireMap(argsVec.nth(j), aCtx);
+
+                requirePresent(argMap, KW_INDEX, aCtx);
+                requirePresent(argMap, KW_ARG, aCtx);
+
+                int index = requireInt(argMap.valAt(KW_INDEX), ctx(beanIndex, "method[" + i + "]-arg[" + j + "].:index"));
                 if (index < 0) {
-                    throw new EdnValidationException(ctx(beanIndex, "method-arg.:index") + ": index must be >= 0, got: " + index);
+                    throw new EdnValidationException(ctx(beanIndex, "method[" + i + "]-arg[" + j + "].:index")
+                            + ": index must be >= 0, got: " + index);
                 }
                 if (!usedIndexes.add(index)) {
-                    throw new EdnValidationException(ctx(beanIndex, "method.:args") + ": duplicate :index " + index
-                            + " for method '" + methodName + "'");
-                }
-                Object form = argMap.valAt(kw("arg"));
-                if (form == null) {
-                    throw new EdnValidationException(ctx(beanIndex, "method-arg.:arg") + ": missing :arg");
+                    throw new EdnValidationException(ctx(beanIndex, "method[" + i + "].:args")
+                            + ": duplicate :index " + index + " for method '" + methodName + "'");
                 }
 
-                BeanValue value = parseArgForm(form, ctx(beanIndex, "method-arg.:arg"));
+                Object form = argMap.valAt(KW_ARG);
+                BeanValue value = parseArgForm(form, ctx(beanIndex, "method[" + i + "]-arg[" + j + "].:arg"));
                 args.add(new MethodArg(index, value));
             }
 
@@ -238,25 +269,14 @@ public final class EdnConfigLoader {
         }
 
         String op = sym.getName();
+
         ISeq tail = seq.next();
         if (tail == null) {
-            if ("value".equals(op)) {
-                throw new EdnValidationException(ctx + ": (value ...) expects exactly 1 argument");
-            }
-            if ("ref".equals(op)) {
-                throw new EdnValidationException(ctx + ": (ref ...) expects exactly 1 argument");
-            }
             throw new EdnValidationException(ctx + ": (" + op + " ...) expects exactly 1 argument");
         }
 
         Object arg1 = tail.first();
         if (tail.next() != null) {
-            if ("value".equals(op)) {
-                throw new EdnValidationException(ctx + ": (value ...) expects exactly 1 argument");
-            }
-            if ("ref".equals(op)) {
-                throw new EdnValidationException(ctx + ": (ref ...) expects exactly 1 argument");
-            }
             throw new EdnValidationException(ctx + ": (" + op + " ...) expects exactly 1 argument");
         }
 
@@ -294,6 +314,12 @@ public final class EdnConfigLoader {
                 Object valObj = e.val();
 
                 String key = mapKeyToString(keyObj, ctx + "[value-map-key]");
+
+                // предотвращаем тихое перетирание после нормализации ключа (например :a и "a")
+                if (entries.containsKey(key)) {
+                    throw new EdnValidationException(ctx + ": duplicate map key after normalization: " + key);
+                }
+
                 entries.put(key, parseValueElement(valObj, ctx + "[value-map:" + key + "]"));
             }
 
@@ -305,8 +331,8 @@ public final class EdnConfigLoader {
     }
 
     private BeanValue parseValueElement(Object el, String ctx) {
-        // allow nested (ref)/(value) OR raw literal
-        if (el instanceof Seqable) {
+        // treat ONLY lists as (ref ...)/(value ...) forms
+        if (el instanceof ISeq) {
             return parseArgForm(el, ctx);
         }
         return new LiteralValue(el);
@@ -336,12 +362,21 @@ public final class EdnConfigLoader {
         throw new EdnValidationException(ctx + ": expected vector, got: " + typeName(o));
     }
 
+    private static void requirePresent(IPersistentMap m, Keyword key, String ctx) {
+        if (m.valAt(key) == null) {
+            throw new EdnValidationException(ctx + ": missing required key :" + key.getName());
+        }
+    }
+
     private static void validateNoUnknownBeanKeys(IPersistentMap bean, String ctx) {
         for (ISeq s = bean.seq(); s != null; s = s.next()) {
             MapEntry e = (MapEntry) s.first();
             Object keyObj = e.key();
 
-            if (!(keyObj instanceof Keyword k) || !ALLOWED_BEAN_KEYS.contains(k)) {
+            if (!(keyObj instanceof Keyword k)) {
+                throw new EdnValidationException(ctx + ": key must be keyword, got: " + typeName(keyObj));
+            }
+            if (!ALLOWED_BEAN_KEYS.contains(k)) {
                 throw new EdnValidationException(ctx + ": unknown key " + formatEdnKey(keyObj)
                         + ". Allowed keys: :name, :class, :scope, :constructor-args, :methods");
             }
@@ -363,7 +398,6 @@ public final class EdnConfigLoader {
     }
 
     private static IPersistentVector emptyVector() {
-        // simplest portable empty vector
         return (IPersistentVector) PersistentVector.EMPTY;
     }
 
@@ -375,5 +409,4 @@ public final class EdnConfigLoader {
         if (k instanceof Keyword kw) return ":" + kw.getName();
         return String.valueOf(k);
     }
-
 }

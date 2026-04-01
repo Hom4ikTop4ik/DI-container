@@ -1,0 +1,7 @@
+{:beans
+ [{:name "broken"
+   :class "demo.Person"
+   :scope :prototype
+   :constructor-args
+   [{:index 0 :arg (ref "noSuchBean")}
+    {:index 1 :arg (value 1)}]}]}

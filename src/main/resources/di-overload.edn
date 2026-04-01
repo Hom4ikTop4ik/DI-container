@@ -1,0 +1,7 @@
+{:beans
+ [{:name "overload"
+   :class "demo.OverloadedSetterDemo"
+   :scope :singleton
+   :methods
+   [{:name "setX"
+     :args [{:index 0 :arg (value 10)}]}]}]}

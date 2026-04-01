@@ -1,0 +1,7 @@
+{:beans
+ [{:name "bad"
+   :class "demo.Foo"
+   :scope :singleton
+   :constructor-args
+   [{:index 0 :arg (ref 123)}]}  ;; ref expects string
+]}

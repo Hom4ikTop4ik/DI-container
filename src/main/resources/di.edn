@@ -1,45 +1,64 @@
 {:beans
  [{:name "fooSingleton"
-   :class "demo.Main$Foo"
+   :class "demo.Foo"
    :scope :singleton}
 
   {:name "fooPrototype"
-   :class "demo.Main$Foo"
+   :class "demo.Foo"
    :scope :prototype}
 
   {:name "fooThread"
-   :class "demo.Main$Foo"
+   :class "demo.Foo"
    :scope :thread}
 
-  {:name "person"
-   :class "demo.Main$Person"
-   :scope :prototype
-   :constructor-args
-   [{:index 0 :arg (value "Alice")}]
-   :methods
-   [{:name "setAge"
-     :args [{:index 0 :arg (value 30)}]}]}
-
+  ;; --- Greeters for @Named ---
   {:name "enGreeter"
-   :class "demo.Main$EnglishGreeter"
+   :class "demo.EnglishGreeter"
    :scope :singleton}
 
   {:name "ruGreeter"
-   :class "demo.Main$RussianGreeter"
+   :class "demo.RussianGreeter"
    :scope :singleton}
 
+  ;; --- thread-scoped dep for scoped proxy demo (singleton -> thread) ---
   {:name "threadRequestId"
-   :class "demo.Main$ThreadRequestIdProvider"
+   :class "demo.ThreadRequestIdProvider"
    :scope :thread}
 
+  ;; singleton, depends on thread-scoped RequestIdProvider + @Named greeter
   {:name "welcomeService"
-   :class "demo.Main$WelcomeService"
+   :class "demo.WelcomeService"
    :scope :singleton}
 
+  ;; --- Provider<T> demo ---
   {:name "prototypeMessage"
-   :class "demo.Main$PrototypeMessage"
+   :class "demo.PrototypeMessage"
    :scope :prototype}
 
   {:name "messagePrinter"
-   :class "demo.Main$MessagePrinter"
-   :scope :singleton}]}
+   :class "demo.MessagePrinter"
+   :scope :singleton}
+
+  ;; --- Config-based injection demo (ctor + methods, conversions) ---
+  {:name "person"
+   :class "demo.Person"
+   :scope :prototype
+   :constructor-args
+   [{:index 0 :arg (value "Alice")}
+    {:index 1 :arg (value "30")}]          ;; String -> int conversion
+   :methods
+   [{:name "setActive" :args [{:index 0 :arg (value true)}]}
+    {:name "setScore"  :args [{:index 0 :arg (value 12)}]}]}
+
+  ;; --- Collections + nested values demo ---
+  {:name "collectionsDemo"
+   :class "demo.ConfigCollectionsDemo"
+   :scope :singleton
+   :constructor-args
+   [{:index 0
+     :arg (value
+           {:title "Demo"
+            :numbers (value [1 2 3])
+            :nested  (value {:k1 "v1"
+                             :k2 (value [10 20 (ref "fooSingleton")])
+                             :k3 (value {:inner (value "x")})})})}]}]}

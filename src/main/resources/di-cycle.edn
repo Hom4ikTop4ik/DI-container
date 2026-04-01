@@ -1,0 +1,4 @@
+{:beans
+ [{:name "cycleA" :class "demo.CycleA" :scope :singleton}
+  {:name "cycleB" :class "demo.CycleB" :scope :singleton}
+  {:name "cycleC" :class "demo.CycleC" :scope :singleton}]}
