@@ -1,0 +1,12 @@
+{:beans
+ [{:name "enGreeter"
+   :class "demo.EnglishGreeter"
+   :scope :singleton}
+
+  {:name "ruGreeter"
+   :class "demo.RussianGreeter"
+   :scope :singleton}
+
+  {:name "ambiguousConsumer"
+   :class "demo.AmbiguousConsumer"
+   :scope :singleton}]}

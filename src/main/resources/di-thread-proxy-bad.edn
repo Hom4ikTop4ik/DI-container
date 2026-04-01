@@ -1,0 +1,8 @@
+{:beans
+ [{:name "threadRequestId"
+   :class "demo.ThreadRequestIdProvider"
+   :scope :thread}
+
+  {:name "configThreadProxyBad"
+   :class "demo.ThreadProxyBadConsumer"
+   :scope :singleton}]}

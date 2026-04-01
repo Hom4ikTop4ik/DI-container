@@ -1,0 +1,7 @@
+{:beans
+ [{:name "badConversion"
+   :class "demo.BadConversionTarget"
+   :scope :singleton
+   :methods
+   [{:name "setAge"
+     :args [{:index 0 :arg (value "not-a-number")}]}]}]}

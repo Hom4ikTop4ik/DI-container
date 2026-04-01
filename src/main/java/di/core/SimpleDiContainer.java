@@ -41,6 +41,238 @@ public final class SimpleDiContainer implements DiContainer {
         this.scopedProxyFactory = Objects.requireNonNull(scopedProxyFactory, "scopedProxyFactory");
     }
 
+    /**
+     * Fail-fast валидация конфигурации контейнера.
+     *
+     * Не создаёт бины, а проверяет:
+     * - корректность ссылок (RefValue -> существующий bean name)
+     * - существование ctor/method по arity для конфиг-инъекций
+     * - полноту индексов args (0..N-1)
+     * - конвертацию LiteralValue к ожидаемым типам (ValueConverter)
+     * - запрет singleton -> thread через config-ref, если тип параметра не интерфейс (прокси невозможно)
+     */
+    public void validate() {
+        // Проверяем все BeanDefinition по очереди.
+        for (BeanDefinition def : defsByName.values()) {
+            validateBeanDefinition(def);
+        }
+    }
+
+    private void validateBeanDefinition(BeanDefinition def) {
+        // 1) constructor args из конфига
+        if (!def.constructorArgs().isEmpty()) {
+            validateConfigConstructor(def);
+        } else {
+            // inject-конструктор уже валидируется логикой selectInjectConstructor при реальном создании,
+            // но можно сделать лёгкую проверку, чтобы ловить ошибки раньше.
+            validateInjectConstructorSelection(def);
+        }
+
+        // 2) method injections из конфига
+        for (MethodInjection mi : def.methodInjections()) {
+            validateConfigMethodInjection(def, mi);
+        }
+
+        // 3) ссылки RefValue внутри constructor/method value-деревьев (включая list/map)
+        // (частично уже проверяется выше, но делаем общий проход)
+        for (MethodArg arg : def.constructorArgs()) {
+            validateRefsExist(arg.value(), def.name());
+        }
+        for (MethodInjection mi : def.methodInjections()) {
+            for (MethodArg arg : mi.arguments()) {
+                validateRefsExist(arg.value(), def.name());
+            }
+        }
+    }
+
+    private void validateConfigConstructor(BeanDefinition def) {
+        List<MethodArg> ctorArgs = def.constructorArgs();
+
+        int maxIndex = ctorArgs.stream().mapToInt(MethodArg::index).max().orElse(-1);
+        int paramCount = maxIndex + 1;
+
+        // По ТЗ: если не все аргументы заданы — ошибка.
+        ensureIndexesComplete(ctorArgs, paramCount,
+                "Bean '" + def.name() + "': constructor args must define all indexes 0.." + (paramCount - 1));
+
+        // Ищем ctor по arity как и в runtime instantiateFromConfig
+        Constructor<?>[] ctors = def.implClass().getDeclaredConstructors();
+        List<Constructor<?>> matches = new ArrayList<>();
+        for (Constructor<?> ctor : ctors) {
+            if (ctor.getParameterCount() == paramCount) {
+                matches.add(ctor);
+            }
+        }
+
+        if (matches.isEmpty()) {
+            throw new IllegalStateException("No constructor with " + paramCount + " parameter(s) for "
+                    + def.implClass().getName() + ". Bean: " + def.name());
+        }
+        if (matches.size() > 1) {
+            throw new IllegalStateException("Ambiguous constructor overload for "
+                    + def.implClass().getName() + " with " + paramCount + " parameter(s). Bean: " + def.name());
+        }
+
+        Constructor<?> ctor = matches.getFirst();
+        Class<?>[] paramTypes = ctor.getParameterTypes();
+
+        // Проверяем значения: literal-конвертация, ref existence, proxy constraints
+        for (MethodArg arg : ctorArgs) {
+            int idx = arg.index();
+            if (idx < 0 || idx >= paramCount) {
+                throw new IllegalStateException("Constructor arg index " + idx + " is out of bounds for "
+                        + def.implClass().getName() + ". Bean: " + def.name());
+            }
+            validateValueAgainstExpectedType(def, arg.value(), paramTypes[idx],
+                    "Bean '" + def.name() + "': constructor-arg[" + idx + "]");
+        }
+    }
+
+    private void validateInjectConstructorSelection(BeanDefinition def) {
+        // Просто прогоняем selectInjectConstructor, чтобы ошибки ловились на validate(), а не при первом getBean().
+        // (Это не создаёт объект.)
+        selectInjectConstructor(def.implClass());
+    }
+
+    private void validateConfigMethodInjection(BeanDefinition def, MethodInjection mi) {
+        String methodName = mi.methodName();
+        List<MethodArg> args = mi.arguments();
+
+        // По текущей логике runtime: выбираем по name + arity и падаем если 0 или >1
+        List<Method> candidates = new ArrayList<>();
+        for (Method m : def.implClass().getMethods()) {
+            if (m.getName().equals(methodName) && m.getParameterCount() == args.size()) {
+                candidates.add(m);
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            throw new IllegalStateException("No suitable method '" + methodName + "' found on "
+                    + def.implClass().getName() + ". Bean: " + def.name());
+        }
+        if (candidates.size() > 1) {
+            throw new IllegalStateException("Ambiguous setter overload for method '" + methodName
+                    + "' on " + def.implClass().getName() + ". Bean: " + def.name());
+        }
+
+        Method method = candidates.getFirst();
+        Class<?>[] paramTypes = method.getParameterTypes();
+
+        // По ТЗ: если не все аргументы заданы — ошибка.
+        ensureIndexesComplete(args, args.size(),
+                "Bean '" + def.name() + "': method '" + methodName + "' args must define all indexes 0.." + (args.size() - 1));
+
+        // Проверяем значения по типам параметров
+        for (MethodArg arg : args) {
+            int idx = arg.index();
+            if (idx < 0 || idx >= paramTypes.length) {
+                throw new IllegalStateException("Method arg index " + idx + " is out of bounds for method '"
+                        + methodName + "' on " + def.implClass().getName() + ". Bean: " + def.name());
+            }
+            validateValueAgainstExpectedType(def, arg.value(), paramTypes[idx],
+                    "Bean '" + def.name() + "': method '" + methodName + "' arg[" + idx + "]");
+        }
+    }
+
+    private void ensureIndexesComplete(List<MethodArg> args, int expectedCount, String errorPrefix) {
+        // expectedCount=0 допустимо
+        if (expectedCount < 0) {
+            throw new IllegalArgumentException("expectedCount must be >= 0");
+        }
+        Set<Integer> idxs = new HashSet<>();
+        for (MethodArg a : args) {
+            idxs.add(a.index());
+        }
+        for (int i = 0; i < expectedCount; i++) {
+            if (!idxs.contains(i)) {
+                throw new IllegalStateException(errorPrefix + ": missing index " + i);
+            }
+        }
+    }
+
+    private void validateRefsExist(BeanValue value, String currentBeanName) {
+        if (value instanceof RefValue ref) {
+            if (!defsByName.containsKey(ref.beanName())) {
+                throw new NoSuchElementException("Bean not found by name: " + ref.beanName()
+                        + " (referenced from bean '" + currentBeanName + "')");
+            }
+            return;
+        }
+        if (value instanceof ListValue list) {
+            for (BeanValue v : list.elements()) {
+                validateRefsExist(v, currentBeanName);
+            }
+            return;
+        }
+        if (value instanceof MapValue map) {
+            for (BeanValue v : map.entries().values()) {
+                validateRefsExist(v, currentBeanName);
+            }
+            return;
+        }
+        // LiteralValue — ok
+    }
+
+    private void validateValueAgainstExpectedType(BeanDefinition current,
+                                                  BeanValue value,
+                                                  Class<?> expectedType,
+                                                  String ctx) {
+        if (value instanceof LiteralValue lit) {
+            // Пробуем конвертацию (fail-fast)
+            try {
+                ValueConverter.convert(lit.value(), expectedType);
+            } catch (RuntimeException e) {
+                throw new IllegalStateException(ctx + ": cannot convert literal to " + expectedType.getName()
+                        + ". Value=" + lit.value(), e);
+            }
+            return;
+        }
+
+        if (value instanceof RefValue ref) {
+            BeanDefinition dep = defsByName.get(ref.beanName());
+            if (dep == null) {
+                throw new NoSuchElementException(ctx + ": bean not found by name: " + ref.beanName());
+            }
+
+            // Проверим, что тип зависимости совместим с параметром (насколько можем).
+            // В runtime ваш resolveConfigValue использует Object.class и НЕ проверяет совместимость,
+            // но это улучшение полезно и безопасно как валидация.
+            if (!expectedType.isAssignableFrom(dep.implClass()) && expectedType != Object.class) {
+                throw new IllegalStateException(ctx + ": bean '" + dep.name() + "' is " + dep.implClass().getName()
+                        + ", not assignable to expected type " + expectedType.getName());
+            }
+
+            // Если singleton зависит от thread-scoped — в runtime это потребует прокси.
+            // Для config-ref мы знаем expectedType (тип параметра/сеттер-арга) -> проверим, что это интерфейс.
+            if (current.scope() == Scope.SINGLETON && dep.scope() == Scope.THREAD) {
+                if (!expectedType.isInterface()) {
+                    throw new IllegalStateException(ctx + ": thread-scoped dependency '" + dep.name()
+                            + "' injected into singleton '" + current.name()
+                            + "' requires proxy, but injection type is not an interface: " + expectedType.getName());
+                }
+            }
+            return;
+        }
+
+        if (value instanceof ListValue list) {
+            // В текущей реализации resolveConfigValue для list/map игнорирует expectedType и возвращает List/Map.
+            // Поэтому здесь делаем минимальную проверку: что элементы валидны сами по себе.
+            for (BeanValue v : list.elements()) {
+                validateValueAgainstExpectedType(current, v, Object.class, ctx + ":list-element");
+            }
+            return;
+        }
+
+        if (value instanceof MapValue map) {
+            for (Map.Entry<String, BeanValue> e : map.entries().entrySet()) {
+                validateValueAgainstExpectedType(current, e.getValue(), Object.class, ctx + ":map-value[" + e.getKey() + "]");
+            }
+            return;
+        }
+
+        throw new IllegalStateException(ctx + ": unsupported BeanValue: " + value);
+    }
+
     private static Map<String, BeanDefinition> indexAndValidate(List<BeanDefinition> definitions) {
         Map<String, BeanDefinition> map = new LinkedHashMap<>();
         for (BeanDefinition def : definitions) {
@@ -68,8 +300,9 @@ public final class SimpleDiContainer implements DiContainer {
         if (def == null) {
             throw new NoSuchElementException("Bean not found by name: " + name + resolutionPathSuffix());
         }
+
         return switch (def.scope()) {
-            case SINGLETON -> singletonCache.computeIfAbsent(def.name(), n -> createNew(def));
+            case SINGLETON -> getOrCreateSingleton(def);
             case PROTOTYPE -> createNew(def);
             case THREAD -> threadCache.get().computeIfAbsent(def.name(), n -> createNew(def));
         };
@@ -125,7 +358,7 @@ public final class SimpleDiContainer implements DiContainer {
             Deque<String> stack = creationStack.get();
             if (stack.contains(def.name())) {
                 throw new IllegalStateException("Cyclic dependency detected: " + formatCycle(stack, def.name()));
-            // Note: resolution path is already encoded into the cycle string above.
+                // Note: resolution path is already encoded into the cycle string above.
             }
             stack.addLast(def.name());
 
@@ -315,29 +548,32 @@ public final class SimpleDiContainer implements DiContainer {
         }
         if (value instanceof RefValue ref) {
             BeanDefinition dep = resolveBeanDefinition(Object.class, ref.beanName());
-            return resolveScopedDependency(current, dep, Object.class, null);
+            // уже фиксили: expectedType нужен для scoped proxy в config-ref
+            return resolveScopedDependency(current, dep, expectedType, null);
         }
         if (value instanceof ListValue list) {
-            List<Object> result = new ArrayList<>();
+            List<Object> result = new ArrayList<>(list.elements().size());
             for (BeanValue v : list.elements()) {
+                // Внутри коллекций целевой тип заранее неизвестен -> Object.class
                 result.add(resolveConfigValue(current, v, Object.class));
             }
-            return result;
+            return List.copyOf(result); // <-- Java List
         }
         if (value instanceof MapValue map) {
-            Map<String, Object> result = new LinkedHashMap<>();
+            Map<String, Object> result = new LinkedHashMap<>(map.entries().size());
             for (Map.Entry<String, BeanValue> e : map.entries().entrySet()) {
+                // ключи уже String из EdnConfigLoader.mapKeyToString
                 result.put(e.getKey(), resolveConfigValue(current, e.getValue(), Object.class));
             }
-            return result;
+            return Map.copyOf(result); // <-- Java Map<String,Object>
         }
         throw new IllegalArgumentException("Unsupported BeanValue: " + value);
     }
 
     private Object resolveInjectionPoint(BeanDefinition current,
-                                        Class<?> rawType,
-                                        Type genericType,
-                                        Named named) {
+                                         Class<?> rawType,
+                                         Type genericType,
+                                         Named named) {
         String name = named == null ? null : named.value();
 
         if (Provider.class.equals(rawType)) {
@@ -393,9 +629,9 @@ public final class SimpleDiContainer implements DiContainer {
     }
 
     private Object resolveScopedDependency(BeanDefinition current,
-                                          BeanDefinition dependency,
-                                          Class<?> injectionType,
-                                          String explicitName) {
+                                           BeanDefinition dependency,
+                                           Class<?> injectionType,
+                                           String explicitName) {
         if (current.scope() == Scope.SINGLETON && dependency.scope() == Scope.THREAD) {
             if (!injectionType.isInterface()) {
                 throw new IllegalStateException("thread-scoped dependency '" + dependency.name()
@@ -516,9 +752,9 @@ public final class SimpleDiContainer implements DiContainer {
     }
 
     private void addInjectDependencyForType(Type genericType,
-                                              Class<?> rawType,
-                                              Named named,
-                                              Set<String> deps) {
+                                            Class<?> rawType,
+                                            Named named,
+                                            Set<String> deps) {
         if (Provider.class.equals(rawType)) {
             Class<?> provided;
             try {
@@ -572,5 +808,20 @@ public final class SimpleDiContainer implements DiContainer {
             return "";
         }
         return " Resolution path: " + String.join(" -> ", stack);
+    }
+
+    private Object getOrCreateSingleton(BeanDefinition def) {
+        // 1) fast path
+        Object existing = singletonCache.get(def.name());
+        if (existing != null) {
+            return existing;
+        }
+
+        // 2) create outside of CHM "compute" to avoid IllegalStateException("Recursive update")
+        Object created = createNew(def);
+
+        // 3) publish (in case of race between threads)
+        Object raced = singletonCache.putIfAbsent(def.name(), created);
+        return raced != null ? raced : created;
     }
 }
